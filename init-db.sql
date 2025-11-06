@@ -34,9 +34,9 @@ CREATE TABLE compatibility (
 );
 
 -- Пользователь с ограниченными правами
-CREATE USER pc_user WITH PASSWORD 'user123';
-GRANT CONNECT ON DATABASE pc_components TO pc_user;
-GRANT USAGE ON SCHEMA public TO pc_user;
+CREATE USER guest WITH PASSWORD '123';
+GRANT CONNECT ON DATABASE pc_components TO guest;
+GRANT USAGE ON SCHEMA public TO guest;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA p>
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pc_us>
 
