@@ -53,8 +53,6 @@ func initLog() {
 		logFile, err = os.OpenFile(os.Getenv("LOG_FILE"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Println("Не удалось открыть лог-файл, логи только в консоль")
-		} else {
-			defer logFile.Close()
 		}
 	}
 }
@@ -103,8 +101,7 @@ func isValidTable(table string) bool {
 	return ok
 }
 
-// === ОСНОВНЫЕ ФУНКЦИИ ПО ТЗ ===
-
+// 6.1.1 — просмотр без фильтрации
 func viewAll(table string) {
 	if !isValidTable(table) {
 		logError("Недопустимая таблица")
@@ -119,6 +116,7 @@ func viewAll(table string) {
 	printRows(rows)
 }
 
+// 6.1.2 — фильтрация по одному полю
 func viewFilteredOne(table string) {
 	if !isValidTable(table) {
 		logError("Недопустимая таблица")
@@ -146,6 +144,7 @@ func viewFilteredOne(table string) {
 	printRows(rows)
 }
 
+// 6.2.1 — обновление одной записи
 func updateSingle(table string) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("ID записи: ")
@@ -190,6 +189,7 @@ func updateSingle(table string) {
 	}
 }
 
+// 6.3.1 — вставка одной строки
 func insertSingle(table string) {
 	if !isValidTable(table) {
 		logError("Недопустимая таблица")
@@ -227,10 +227,11 @@ func insertSingle(table string) {
 	if err != nil {
 		logError("Ошибка вставки")
 	} else {
-		logCarlos("Запись добавлена")
+		logInfo("Запись успешно добавлена")
 	}
 }
 
+// 6.3.2 — вставка в связанные таблицы
 func insertRelated() {
 	tx, err := db.Begin()
 	if err != nil {
@@ -239,22 +240,39 @@ func insertRelated() {
 	}
 	reader := bufio.NewReader(os.Stdin)
 
-	// Вставка в components
-	fmt.Println("=== Добавление компонента ===")
 	var compID int
+	fmt.Println("=== Добавление компонента ===")
+	fmt.Print("name: ")
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	fmt.Print("category_id: ")
+	catID, _ := reader.ReadString('\n')
+	fmt.Print("manufacturer_id: ")
+	manID, _ := reader.ReadString('\n')
+	fmt.Print("model: ")
+	model, _ := reader.ReadString('\n')
+	fmt.Print("price: ")
+	price, _ := reader.ReadString('\n')
+	fmt.Print("release_year: ")
+	year, _ := reader.ReadString('\n')
+
 	err = tx.QueryRow(`
 		INSERT INTO components (name, category_id, manufacturer_id, model, price, release_year) 
 		VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-		"RTX 5090", 2, 3, "FOUNDERS", 2500.00, 2025).Scan(&compID)
+		name, catID, manID, model, price, year).Scan(&compID)
 	if err != nil {
 		tx.Rollback()
 		logError("Ошибка вставки компонента")
 		return
 	}
 
-	// Вставка в stock
+	fmt.Print("quantity на складе: ")
+	quantity, _ := reader.ReadString('\n')
+	fmt.Print("warehouse_location: ")
+	location, _ := reader.ReadString('\n')
+
 	_, err = tx.Exec(`INSERT INTO stock (component_id, quantity, warehouse_location) VALUES ($1,$2,$3)`,
-		compID, 10, "X1")
+		compID, strings.TrimSpace(quantity), strings.TrimSpace(location))
 	if err != nil {
 		tx.Rollback()
 		logError("Ошибка добавления на склад")
@@ -262,11 +280,10 @@ func insertRelated() {
 	}
 
 	tx.Commit()
-	logInfo(fmt.Sprintf("Компонент и склад добавлены! ID компонента: %d", compID))
+	logInfo(fmt.Sprintf("Компонент и запись на склад добавлены! ID компонента: %d", compID))
 }
 
-// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-
+// Красивая печать результата SELECT
 func printRows(rows *sql.Rows) {
 	cols, _ := rows.Columns()
 	var records [][]interface{}
@@ -280,13 +297,13 @@ func printRows(rows *sql.Rows) {
 		records = append(records, values)
 	}
 
-	// Печать заголовков
+	// Заголовки
 	for _, col := range cols {
 		fmt.Printf("%-20s", col)
 	}
 	fmt.Println("\n" + strings.Repeat("-", 20*len(cols)))
 
-	// Печать строк
+	// Данные
 	for _, record := range records {
 		for _, val := range record {
 			if val == nil {
@@ -304,10 +321,11 @@ func main() {
 	cfg, _ := loadConfig()
 	initLog()
 
-	reader := bufio.NewReader(os.Stdin)
+	// Ввод логина/пароля
 	fmt.Print("Логин: ")
-	user, _ := reader.ReadString('\n')
-	cfg.User = strings.TrimSpace(user)
+	userInput, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	cfg.User = strings.TrimSpace(userInput)
+
 	fmt.Print("Пароль: ")
 	pass, _ := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
@@ -318,6 +336,8 @@ func main() {
 		return
 	}
 	logInfo("Подключение к БД успешно")
+
+	reader := bufio.NewReader(os.Stdin)
 
 	for {
 		fmt.Println("\n=== МЕНЮ ===")
@@ -336,32 +356,27 @@ func main() {
 			break
 		}
 
-		if strings.HasPrefix(choice, "1") {
+		switch choice {
+		case "1":
 			fmt.Print("Таблица (categories/manufacturers/components/stock): ")
 			table, _ := reader.ReadString('\n')
-			table = strings.TrimSpace(table)
-			viewAll(table)
-		}
-		if strings.HasPrefix(choice, "2") {
+			viewAll(strings.TrimSpace(table))
+		case "2":
 			fmt.Print("Таблица: ")
 			table, _ := reader.ReadString('\n')
-			table = strings.TrimSpace(table)
-			viewFilteredOne(table)
-		}
-		if strings.HasPrefix(choice, "3") {
+			viewFilteredOne(strings.TrimSpace(table))
+		case "3":
 			fmt.Print("Таблица: ")
 			table, _ := reader.ReadString('\n')
-			table = strings.TrimSpace(table)
-			updateSingle(table)
-		}
-		if strings.HasPrefix(choice, "4") {
+			updateSingle(strings.TrimSpace(table))
+		case "4":
 			fmt.Print("Таблица: ")
 			table, _ := reader.ReadString('\n')
-			table = strings.TrimSpace(table)
-			insertSingle(table)
-		}
-		if strings.HasPrefix(choice, "5") {
+			insertSingle(strings.TrimSpace(table))
+		case "5":
 			insertRelated()
+		default:
+			fmt.Println("Неверный выбор")
 		}
 	}
 }
