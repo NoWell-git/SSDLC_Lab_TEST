@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    container_name: lab3
+    environment:
+      POSTGRES_DB: pc_components
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - pcnet
+
+  pc-app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: pc-app
+    env_file:
+      - config.env
+    depends_on:
+      - postgres
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./logs:/logs
+    networks:
+      - pcnet
+
+  adminer:
+    image: adminer
+    restart: always
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    networks:
+      - pcnet
+
+networks:
+  pcnet:
+    driver: bridge
