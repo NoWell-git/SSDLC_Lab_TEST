@@ -1,6 +1,0 @@
-host: "postgres"
-port: 5432
-database: "db1"
-user: ""
-password: ""
-sslmode: disable
