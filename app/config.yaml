@@ -1,6 +1,6 @@
 host: "postgres"
 port: 5432
-database: "pc_components"
+database: "db1"
 user: ""
 password: ""
 sslmode: disable
