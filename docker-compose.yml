@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.postgres
-    container_name: lab3
+    container_name: lab3_postgres
     environment:
       POSTGRES_DB: pc_components
       POSTGRES_USER: admin
@@ -11,15 +11,13 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    networks:
-      - pcnet
+      - ./pgdata:/var/lib/postgresql/data
 
   pc-app:
     build:
       context: .
       dockerfile: Dockerfile.app
-    container_name: app
+    container_name: lab3_app
     env_file:
       - config.env
     depends_on:
@@ -28,8 +26,7 @@ services:
     tty: true
     volumes:
       - ./logs:/logs
-    networks:
-      - pcnet
+    network_mode: service:postgres
 
   adminer:
     image: adminer
@@ -38,9 +35,3 @@ services:
       - postgres
     ports:
       - "8080:8080"
-    networks:
-      - pcnet
-
-networks:
-  pcnet:
-    driver: bridge
