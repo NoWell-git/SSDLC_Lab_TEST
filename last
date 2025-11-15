@@ -1,0 +1,271 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
+)
+
+var tables = []string{"categories", "manufacturers", "components", "stock"}
+var columns = map[string][]string{
+	"categories":     {"id", "name", "description"},
+	"manufacturers":  {"id", "name", "country", "founded_year"},
+	"components":     {"id", "name", "category_id", "manufacturer_id", "model", "price", "specs"},
+	"stock":          {"id", "component_id", "quantity", "warehouse_location", "last_updated"},
+}
+
+type App struct{ conn *pgx.Conn; logger *log.Logger }
+
+func main() {
+	cfg := loadEnv()
+	conn := connect(cfg)
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+	if cfg.LogFile != "" {
+		f, _ := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		logger = log.New(f, "", log.LstdFlags); defer f.Close()
+	}
+	fmt.Println("Подключение к БД успешно!")
+	(&App{conn, logger}).run()
+}
+
+func loadEnv() struct{ Host, Port, Database, User, Password, SSLMode, LogFile string } {
+	godotenv.Load("config.env")
+	return struct{ Host, Port, Database, User, Password, SSLMode, LogFile string }{
+		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), os.Getenv("DB_NAME"),
+		read("Логин: "), read("Пароль: "), os.Getenv("DB_SSLMODE"), os.Getenv("LOG_FILE"),
+	}
+}
+
+func connect(cfg any) *pgx.Conn {
+	c := cfg.(struct{ Host, Port, Database, User, Password, SSLMode, LogFile string })
+	conn, err := pgx.Connect(context.Background(),
+		fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s",
+			c.Host, c.Port, c.Database, c.User, c.Password, c.SSLMode))
+	if err != nil { log.Fatal(err) }
+	return conn
+}
+
+func (a *App) run() {
+	for {
+		printMenu()
+		switch c := choice("> "); c {
+		case "1": a.viewTable()
+		case "2": a.filterTable()
+		case "3": a.updateRecords()
+		case "4": a.insertIntoTable()
+		case "5": a.insertRelated()
+		case "0": fmt.Println("Выход..."); return
+		default: fmt.Println("Неверный выбор")
+		}
+	}
+}
+
+func printMenu() {
+	fmt.Println("\n=== МЕНЮ ===")
+	fmt.Println("1. Просмотр таблицы")
+	fmt.Println("2. Фильтрация")
+	fmt.Println("3. Обновить запись")
+	fmt.Println("4. Добавить запись")
+	fmt.Println("5. Добавить в связанные таблицы")
+	fmt.Println("0. Выход")
+}
+
+func read(prompt string) string {
+	fmt.Print(prompt); s := strings.TrimSpace(scan()); if s == "" { log.Fatal("Пусто") }; return s
+}
+
+func choice(prompt string) string { fmt.Print(prompt); return strings.TrimSpace(scan()) }
+
+func scan() string { scanner := bufio.NewScanner(os.Stdin); scanner.Scan(); return scanner.Text() }
+
+// === ВЫБОР ===
+func selectOpt(prompt string, opts []string, back bool) string {
+	for {
+		if prompt != "" { fmt.Println(prompt) }
+		for i, o := range opts { fmt.Printf("%d. %s\n", i+1, o) }
+		if back { fmt.Println("0. Назад") }
+		c := choice("> ")
+		if c == "0" && back { return "" }
+		if i, e := strconv.Atoi(c); e == nil && i > 0 && i <= len(opts) { return opts[i-1] }
+		fmt.Println("Неверно")
+	}
+}
+
+func (a *App) selectTable() string  { return selectOpt("Таблица:", tables, true) }
+func (a *App) selectCol(t string) string { return selectOpt("Колонка:", columns[t], true) }
+func (a *App) selectMode() string  { return selectOpt("", []string{"Одна", "Несколько"}, true) }
+
+// === 1. ПРОСМОТР ===
+func (a *App) viewTable() {
+	t := a.selectTable(); if t == "" { return }
+	a.query("SELECT * FROM "+t, nil); a.log("Просмотр: " + t)
+}
+
+// === 2. ФИЛЬТРАЦИЯ ===
+func (a *App) filterTable() {
+	m := a.selectMode(); if m == "" { return }
+	t := a.selectTable(); if t == "" { return }
+	var w []string; var args []interface{}
+	if m == "Одна" {
+		c := a.selectCol(t); if c == "" { return }
+		v := read(c + ": "); w = append(w, c+" = $1"); args = append(args, v)
+	} else {
+		for {
+			c := a.selectCol(t); if c == "" { break }
+			v := read(c + ": "); w = append(w, c+" = $"+strconv.Itoa(len(args)+1)); args = append(args, v)
+			if choice("Ещё? (y/n): ") != "y" { break }
+		}
+	}
+	if len(w) == 0 { return }
+	q := "SELECT * FROM " + t + " WHERE " + strings.Join(w, " AND ")
+	a.query(q, args); a.log("Фильтр: " + q)
+}
+
+// === 3. ОБНОВЛЕНИЕ ===
+func (a *App) updateRecords() {
+	m := a.selectMode(); if m == "" { return }
+	t := a.selectTable(); if t == "" { return }
+	if m == "Одна" {
+		id := read("ID: "); u, args := a.updates(t); if len(u) == 0 { return }
+		args = append(args, id); q := "UPDATE " + t + " SET " + strings.Join(u, ", ") + " WHERE id = $" + strconv.Itoa(len(args))
+		a.exec(q, args); a.log("Обновление: " + q)
+	} else {
+		ids := read("ID (запятая): "); c := a.selectCol(t); if c == "" { return }
+		v := read("Значение: "); idl := split(ids); in := make([]string, 0, len(idl)); args := []interface{}{v}
+		for i, id := range idl { if id == "" { continue }; in = append(in, "$"+strconv.Itoa(i+2)); args = append(args, id) }
+		if len(in) == 0 { return }
+		q := "UPDATE " + t + " SET " + c + " = $1 WHERE id IN (" + strings.Join(in, ",") + ")"
+		a.exec(q, args); a.log("Массовое: " + q)
+	}
+}
+
+func (a *App) updates(t string) ([]string, []interface{}) {
+	var u []string; var args []interface{}
+	for { c := a.selectCol(t); if c == "" { break }; v := read(c + ": "); u = append(u, c+" = $"+strconv.Itoa(len(args)+1)); args = append(args, v); if choice("Ещё? (y/n): ") != "y" { break } }
+	return u, args
+}
+
+// === 4. ВСТАВКА ===
+func (a *App) insertIntoTable() {
+	m := a.selectMode(); if m == "" { return }
+	t := a.selectTable(); if t == "" { return }
+	if m == "Одна" { a.insertOne(t) } else { a.insertMany(t) }
+}
+
+func (a *App) insertOne(t string) {
+	cols := a.cols(t); if len(cols) == 0 { return }
+	args := make([]interface{}, len(cols)); ph := make([]string, len(cols))
+	for i, c := range cols { v := read(c + ": "); ph[i] = "$" + strconv.Itoa(i+1); args[i] = v }
+	q := "INSERT INTO " + t + " (" + strings.Join(cols, ", ") + ") VALUES (" + strings.Join(ph, ", ") + ")"
+	a.exec(q, args); a.log("Вставка: " + q)
+}
+
+func (a *App) insertMany(t string) {
+	cols := a.cols(t); if len(cols) == 0 { return }
+	n := readInt("Сколько? "); if n <= 0 { return }
+	args := []interface{}{}; ph := []string{}
+	for i := 0; i < n; i++ {
+		row := []string{}
+		for _, c := range cols {
+			v := read(fmt.Sprintf("[%d] %s: ", i+1, c)); row = append(row, "$"+strconv.Itoa(len(args)+1)); args = append(args, v)
+		}
+		ph = append(ph, "("+strings.Join(row, ", ")+")")
+	}
+	q := "INSERT INTO " + t + " (" + strings.Join(cols, ", ") + ") VALUES " + strings.Join(ph, ", ")
+	a.exec(q, args); a.log("Множественная: " + strconv.Itoa(n))
+}
+
+func (a *App) cols(t string) []string {
+	valid := map[int]string{}; cnt := 1
+	fmt.Println("Колонки (без id):")
+	for _, c := range columns[t] { if c != "id" { valid[cnt] = c; fmt.Printf("%d. %s\n", cnt, c); cnt++ } }
+	fmt.Println("0. Назад")
+	for {
+		c := choice("> ")
+		if c == "0" { return nil }
+		s := split(c); res := []string{}
+		for _, id := range s { if i, e := strconv.Atoi(id); e == nil { if col, ok := valid[i]; ok && !has(res, col) { res = append(res, col) } } }
+		if len(res) > 0 { return res }
+		fmt.Println("Выберите хотя бы одну")
+	}
+}
+
+// === 5. СВЯЗАННЫЕ (6.3.2 + 6.4.2) ===
+func (a *App) insertRelated() {
+	m := a.selectMode(); if m == "" { return }
+	if m == "Одна" { a.relatedOne() } else { a.relatedMany() }
+}
+
+// 6.3.2 — одна пара
+func (a *App) relatedOne() {
+	var id int
+	err := a.conn.QueryRow(context.Background(),
+		`INSERT INTO components (name, category_id, manufacturer_id, model, price, specs)
+		 VALUES ('CPU-X', 1, 1, 'X1', 99.99, '{"core":8}') RETURNING id`).Scan(&id)
+	if err != nil { a.err("components"); return }
+	_, err = a.conn.Exec(context.Background(),
+		`INSERT INTO stock (component_id, quantity, warehouse_location) VALUES ($1, 50, 'WH-A')`, id)
+	if err != nil { a.err("stock"); return }
+	fmt.Println("Пара добавлена (id =", id, ")"); a.log("Связка: id=" + strconv.Itoa(id))
+}
+
+// 6.4.2 — несколько пар
+func (a *App) relatedMany() {
+	n := readInt("Сколько пар? "); if n <= 0 { return }
+	for i := 1; i <= n; i++ {
+		var id int; name := fmt.Sprintf("CPU-%d", i); model := fmt.Sprintf("M-%d", i); price := 99.99 + float64(i-1)*10
+		err := a.conn.QueryRow(context.Background(),
+			`INSERT INTO components (name, category_id, manufacturer_id, model, price, specs)
+			 VALUES ($1, 1, 1, $2, $3, '{"core":8}') RETURNING id`, name, model, price).Scan(&id)
+		if err != nil { a.err("components"); continue }
+		_, err = a.conn.Exec(context.Background(),
+			`INSERT INTO stock (component_id, quantity, warehouse_location) VALUES ($1, $2, 'WH-A')`, id, 10+i*5)
+		if err != nil { a.err("stock"); continue }
+		fmt.Printf("Пара %d: id=%d\n", i, id)
+	}
+	a.log("Связки: " + strconv.Itoa(n) + " пар")
+}
+
+// === УТИЛИТЫ ===
+func (a *App) exec(q string, args []interface{}) {
+	if _, e := a.conn.Exec(context.Background(), q, args...); e != nil { a.err(e.Error()) } else { fmt.Println("Готово") }
+}
+
+func (a *App) query(q string, args []interface{}) {
+	r, e := a.conn.Query(context.Background(), q, args...); if e != nil { a.err(e.Error()); return }; defer r.Close()
+	printTable(r)
+}
+
+func printTable(r pgx.Rows) {
+	d := r.FieldDescriptions(); h := make([]string, len(d)); w := make([]int, len(d))
+	for i, f := range d { h[i] = string(f.Name); if len(h[i]) > w[i] { w[i] = len(h[i]) } }
+	data := [][]string{}
+	for r.Next() {
+		v := make([]interface{}, len(d)); p := make([]interface{}, len(d))
+		for i := range v { p[i] = &v[i] }; r.Scan(p...)
+		row := make([]string, len(d))
+		for i, val := range v { s := "NULL"; if val != nil { s = fmt.Sprint(val) }; row[i] = s; if len(s) > w[i] { w[i] = len(s) } }
+		data = append(data, row)
+	}
+	printRow(h, w); fmt.Println(strings.Repeat("=", sum(w)+3*len(w)+1))
+	for _, row := range data { printRow(row, w) }
+}
+
+func printRow(r []string, w []int) {
+	p := make([]string, len(r)); for i, c := range r { p[i] = pad(c, w[i]) }; fmt.Printf("| %s |\n", strings.Join(p, " | "))
+}
+
+func pad(s string, width int) string { if len(s) < width { return s + strings.Repeat(" ", width-len(s)) }; return s }
+func sum(a []int) int { s := 0; for _, v := range a { s += v }; return s }
+func readInt(p string) int { for { if n, e := strconv.Atoi(read(p)); e == nil && n > 0 { return n }; fmt.Println("Число > 0") } }
+func split(s string) []string { p := strings.Split(s, ","); for i := range p { p[i] = strings.TrimSpace(p[i]) }; return p }
+func has(a []string, s string) bool { for _, v := range a { if v == s { return true } }; return false }
+func (a *App) log(m string) { a.logger.Println(m) }
+func (a *App) err(m string) { a.logger.Println("ОШИБКА: " + m); fmt.Fprintln(os.Stderr, "Ошибка") }
