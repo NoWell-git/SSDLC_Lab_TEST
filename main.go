@@ -21,7 +21,6 @@ type Config struct {
         Password       string
         SSLMode        string
         LogFile        string
-        RequestTimeout string
 }
 
 var db *sql.DB
@@ -43,7 +42,6 @@ func loadConfig() (Config, error) {
                 Database:       os.Getenv("DB_NAME"),
                 SSLMode:        os.Getenv("DB_SSLMODE"),
                 LogFile:        os.Getenv("LOG_FILE"),
-                RequestTimeout: os.Getenv("REQUEST_TIMEOUT"),
         }, nil
 }
 
