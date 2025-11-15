@@ -26,8 +26,7 @@ services:
     tty: true
     volumes:
       - ./logs:/logs
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: service:postgres
 
   adminer:
     image: adminer
