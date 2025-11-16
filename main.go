@@ -1,529 +1,705 @@
 package main
 
 import (
-        "bufio"
-        "database/sql"
-        "fmt"
-        "os"
-        "strings"
-        "time"
+	"bufio"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 
-        _ "github.com/jackc/pgx/v5/stdlib"
-        "github.com/joho/godotenv"
-        "golang.org/x/term"
+	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
 )
 
+var tables = []string{"categories", "manufacturers", "components", "stock"}
+var columns = map[string][]string{
+	"categories":    {"id", "name", "description"},
+	"manufacturers": {"id", "name", "country", "founded_year"},
+	"components":    {"id", "name", "category_id", "manufacturer_id", "model", "price"},
+	"stock":         {"id", "component_id", "quantity", "warehouse_location"},
+}
+
+type App struct {
+	conn   *pgx.Conn
+	logger *log.Logger
+}
+
 type Config struct {
-        Host           string
-        Port           string
-        Database       string
-        User           string
-        Password       string
-        SSLMode        string
-        LogFile        string
-}
-
-var db *sql.DB
-var logFile *os.File
-
-// Белые списки колонок для каждой таблицы
-var whiteLists = map[string][]string{
-        "categories":    {"id", "name"},
-        "manufacturers": {"id", "name", "country"},
-        "components":    {"id", "name", "category_id", "manufacturer_id", "model", "price", "release_year"},
-        "stock":         {"id", "component_id", "quantity", "warehouse_location"},
-}
-
-func loadConfig() (Config, error) {
-        godotenv.Load("config.env")
-        return Config{
-                Host:           os.Getenv("DB_HOST"),
-                Port:           os.Getenv("DB_PORT"),
-                Database:       os.Getenv("DB_NAME"),
-                SSLMode:        os.Getenv("DB_SSLMODE"),
-                LogFile:        os.Getenv("LOG_FILE"),
-        }, nil
-}
-
-func initLog() {
-        if os.Getenv("LOG_FILE") != "" {
-                var err error
-                logFile, err = os.OpenFile(os.Getenv("LOG_FILE"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-                if err != nil {
-                        fmt.Println("Не удалось открыть лог-файл, логи только в консоль")
-                }
-        }
-}
-
-func logInfo(msg string) {
-        fmt.Println(msg)
-        if logFile != nil {
-                fmt.Fprintf(logFile, "[%s] INFO: %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
-        }
-}
-
-func logError(msg string) {
-        fmt.Fprintf(os.Stderr, "ОШИБКА: %s\n", msg)
-        if logFile != nil {
-			    fmt.Fprintf(logFile, "[%s] ERROR: %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
-        }
-}
-
-func connectDB(cfg Config) error {
-        connStr := fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s",
-                cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode)
-        var err error
-        db, err = sql.Open("pgx", connStr)
-        if err != nil {
-                return err
-        }
-        db.SetMaxOpenConns(10)
-        return db.Ping()
-}
-
-func isValidColumn(table, col string) bool {
-        cols, ok := whiteLists[table]
-        if !ok {
-                return false
-        }
-        for _, c := range cols {
-                if c == col {
-                        return true
-                }
-        }
-        return false
-}
-
-func isValidTable(table string) bool {
-        _, ok := whiteLists[table]
-        return ok
-}
-
-// 6.1.1 — просмотр без фильтрации
-func viewAll(table string) {
-        if !isValidTable(table) {
-                logError("Недопустимая таблица")
-                return
-        }
-        rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s", table))
-        if err != nil {
-                logError("Не удалось получить данные")
-                return
-        }
-        defer rows.Close()
-        printRows(rows)
-}
-
-// 6.1.2 — фильтрация по одному полю
-func viewFilteredOne(table string) {
-        if !isValidTable(table) {
-                logError("Недопустимая таблица")
-                return
-        }
-        reader := bufio.NewReader(os.Stdin)
-        fmt.Print("Колонка для фильтрации: ")
-        col, _ := reader.ReadString('\n')
-        col = strings.TrimSpace(col)
-        if !isValidColumn(table, col) {
-                logError("Недопустимая колонка")
-                return
-        }
-        fmt.Print("Значение: ")
-        val, _ := reader.ReadString('\n')
-        val = strings.TrimSpace(val)
-        query := fmt.Sprintf("SELECT * FROM %s WHERE %s = $1", table, col)
-        rows, err := db.Query(query, val)
-        if err != nil {
-                logError("Ошибка фильтрации")
-                return
-        }
-        defer rows.Close()
-        printRows(rows)
-}
-
-// 6.1.3 — фильтрация по нескольким полям
-func viewFilteredMultiple(table string) {
-        if !isValidTable(table) {
-                logError("Недопустимая таблица")
-                return
-        }
-        reader := bufio.NewReader(os.Stdin)
-        whereParts := []string{}
-        args := []interface{}{}
-        argIndex := 1
-        fmt.Println("Введите колонки и значения для фильтрации (пустая строка — завершить):")
-        for {
-                fmt.Print("Колонка: ")
-                col, _ := reader.ReadString('\n')
-                col = strings.TrimSpace(col)
-                if col == "" {
-                        break
-                }
-                if !isValidColumn(table, col) {
-                        logError("Недопустимая колонка")
-                        continue
-                }
-                fmt.Print("Значение: ")
-                val, _ := reader.ReadString('\n')
-                val = strings.TrimSpace(val)
-                whereParts = append(whereParts, fmt.Sprintf("%s = $%d", col, argIndex))
-                args = append(args, val)
-                argIndex++
-        }
-        if len(whereParts) == 0 {
-                logError("Нет условий для фильтрации")
-                return
-        }
-        query := fmt.Sprintf("SELECT * FROM %s WHERE %s", table, strings.Join(whereParts, " AND "))
-        rows, err := db.Query(query, args...)
-        if err != nil {
-                logError("Ошибка фильтрации")
-                return
-        }
-        defer rows.Close()
-        printRows(rows)
-}
-
-// 6.2.1 — обновление одной записи
-func updateSingle(table string) {
-        reader := bufio.NewReader(os.Stdin)
-        fmt.Print("ID записи: ")
-        idStr, _ := reader.ReadString('\n')
-        var id int
-        fmt.Sscanf(idStr, "%d", &id)
-        setParts := []string{}
-        args := []interface{}{}
-        argIndex := 1
-        fmt.Println("Введите колонки и значения (пустая строка — завершить):")
-        for {
-                fmt.Print("Колонка: ")
-                col, _ := reader.ReadString('\n')
-                col = strings.TrimSpace(col)
-                if col == "" {
-                        break
-                }
-                if !isValidColumn(table, col) || col == "id" {
-                        fmt.Println("Недопустимая колонка")
-                        continue
-                }
-                fmt.Print("Новое значение: ")
-                val, _ := reader.ReadString('\n')
-                val = strings.TrimSpace(val)
-                setParts = append(setParts, fmt.Sprintf("%s = $%d", col, argIndex))
-                args = append(args, val)
-                argIndex++
-        }
-        if len(setParts) == 0 {
-                fmt.Println("Ничего не обновлено")
-                return
-        }
-        args = append(args, id)
-        query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", table, strings.Join(setParts, ", "), argIndex)
-        _, err := db.Exec(query, args...)
-        if err != nil {
-                logError("Не удалось обновить запись")
-        } else {
-                logInfo("Запись успешно обновлена")
-        }
-}
-
-// 6.2.2 — обновление нескольких записей по IN
-func updateMultiple(table string) {
-        reader := bufio.NewReader(os.Stdin)
-        fmt.Print("Колонка для обновления: ")
-        updateCol, _ := reader.ReadString('\n')
-        updateCol = strings.TrimSpace(updateCol)
-        if !isValidColumn(table, updateCol) || updateCol == "id" {
-                logError("Недопустимая колонка для обновления")
-                return
-        }
-        fmt.Print("Новое значение: ")
-        newVal, _ := reader.ReadString('\n')
-        newVal = strings.TrimSpace(newVal)
-        fmt.Print("Колонка для фильтрации (IN): ")
-        filterCol, _ := reader.ReadString('\n')
-        filterCol = strings.TrimSpace(filterCol)
-        if !isValidColumn(table, filterCol) {
-                logError("Недопустимая колонка для фильтрации")
-                return
-        }
-        fmt.Print("Значения для IN (через запятую): ")
-        valuesStr, _ := reader.ReadString('\n')
-        valuesStr = strings.TrimSpace(valuesStr)
-        values := strings.Split(valuesStr, ",")
-        args := []interface{}{newVal}
-        placeholders := []string{}
-        for i, val := range values {
-                placeholders = append(placeholders, fmt.Sprintf("$%d", i+2))
-                args = append(args, strings.TrimSpace(val))
-        }
-        if len(placeholders) == 0 {
-                logError("Нет значений для фильтрации")
-                return
-        }
-        query := fmt.Sprintf("UPDATE %s SET %s = $1 WHERE %s IN (%s)", table, updateCol, filterCol, strings.Join(placeholders, ", "))
-        _, err := db.Exec(query, args...)
-        if err != nil {
-                logError("Не удалось обновить записи")
-        } else {
-                logInfo("Записи успешно обновлены")
-        }
-}
-
-// 6.3.1 — вставка одной строки
-func insertSingle(table string) {
-        if !isValidTable(table) {
-                logError("Недопустимая таблица")
-                return
-        }
-        reader := bufio.NewReader(os.Stdin)
-        cols := whiteLists[table]
-        cols = cols[1:] // убираем id
-        values := []interface{}{}
-        placeholders := []string{}
-        selectedCols := []string{}
-        argIndex := 1
-        for _, col := range cols {
-                fmt.Printf("%s: ", col)
-                val, _ := reader.ReadString('\n')
-                val = strings.TrimSpace(val)
-                if val == "" {
-                        continue // Пропуск необязательных
-                }
-                selectedCols = append(selectedCols, col)
-                values = append(values, val)
-                placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
-                argIndex++
-        }
-        if len(placeholders) == 0 {
-                logError("Нет данных для вставки")
-                return
-        }
-        query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-                table, strings.Join(selectedCols, ", "), strings.Join(placeholders, ", "))
-        _, err := db.Exec(query, values...)
-        if err != nil {
-                logError("Ошибка вставки")
-        } else {
-                logInfo("Запись успешно добавлена")
-        }
-}
-
-// 6.4.1 — вставка нескольких строк в одну таблицу
-func insertMultipleSingle(table string) {
-        if !isValidTable(table) {
-                logError("Недопустимая таблица")
-                return
-        }
-        reader := bufio.NewReader(os.Stdin)
-        cols := whiteLists[table]
-        cols = cols[1:] // убираем id
-        numRows := 0
-        fmt.Print("Количество строк для вставки: ")
-        fmt.Scanf("%d\n", &numRows)
-        if numRows <= 0 {
-                logError("Неверное количество")
-                return
-        }
-        values := []interface{}{}
-        placeholders := []string{}
-        argIndex := 1
-        for i := 0; i < numRows; i++ {
-                rowPlaceholders := []string{}
-                fmt.Printf("Строка %d:\n", i+1)
-                for _, col := range cols {
-                        fmt.Printf("%s: ", col)
-                        val, _ := reader.ReadString('\n')
-                        val = strings.TrimSpace(val)
-                        if val == "" {
-                                continue
-                        }
-                        rowPlaceholders = append(rowPlaceholders, fmt.Sprintf("$%d", argIndex))
-                        values = append(values, val)
-                        argIndex++
-                }
-                if len(rowPlaceholders) > 0 {
-                        placeholders = append(placeholders, fmt.Sprintf("(%s)", strings.Join(rowPlaceholders, ", ")))
-                }
-        }
-        if len(placeholders) == 0 {
-                logError("Нет данных для вставки")
-                return
-        }
-        query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-                table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-        _, err := db.Exec(query, values...)
-        if err != nil {
-                logError("Ошибка вставки")
-        } else {
-                logInfo("Строки успешно добавлены")
-        }
-}
-
-// 6.3.2 / 6.4.2 — вставка в связанные таблицы (одна или несколько строк)
-func insertRelated(multiple bool) {
-        reader := bufio.NewReader(os.Stdin)
-        numRows := 1
-        if multiple {
-                fmt.Print("Количество наборов для вставки: ")
-                fmt.Scanf("%d\n", &numRows)
-                if numRows <= 0 {
-                        logError("Неверное количество")
-                        return
-                }
-        }
-        tx, err := db.Begin()
-        if err != nil {
-                logError("Не удалось начать транзакцию")
-                return
-        }
-        for i := 0; i < numRows; i++ {
-                var compID int
-                fmt.Printf("=== Добавление компонента %d ===\n", i+1)
-                fmt.Print("name: ")
-                name, _ := reader.ReadString('\n')
-                name = strings.TrimSpace(name)
-                fmt.Print("category_id: ")
-                catID, _ := reader.ReadString('\n')
-                catID = strings.TrimSpace(catID)
-                fmt.Print("manufacturer_id: ")
-                manID, _ := reader.ReadString('\n')
-                manID = strings.TrimSpace(manID)
-                fmt.Print("model: ")
-                model, _ := reader.ReadString('\n')
-                model = strings.TrimSpace(model)
-                fmt.Print("price: ")
-                price, _ := reader.ReadString('\n')
-                price = strings.TrimSpace(price)
-                fmt.Print("release_year: ")
-                year, _ := reader.ReadString('\n')
-                year = strings.TrimSpace(year)
-                err = tx.QueryRow(`
-                        INSERT INTO components (name, category_id, manufacturer_id, model, price, release_year)
-                        VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-                        name, catID, manID, model, price, year).Scan(&compID)
-                if err != nil {
-                        tx.Rollback()
-                        logError("Ошибка вставки компонента")
-                        return
-                }
-                fmt.Print("quantity на складе: ")
-                quantity, _ := reader.ReadString('\n')
-                quantity = strings.TrimSpace(quantity)
-                fmt.Print("warehouse_location: ")
-                location, _ := reader.ReadString('\n')
-                location = strings.TrimSpace(location)
-                _, err = tx.Exec(`INSERT INTO stock (component_id, quantity, warehouse_location) VALUES ($1,$2,$3)`,
-                        compID, quantity, location)
-                if err != nil {
-                        tx.Rollback()
-                        logError("Ошибка добавления на склад")
-                        return
-                }
-        }
-        err = tx.Commit()
-        if err != nil {
-                logError("Ошибка коммита транзакции")
-        } else {
-                logInfo("Компоненты и записи на склад добавлены")
-        }
-}
-
-// Красивая печать результата SELECT
-func printRows(rows *sql.Rows) {
-        cols, _ := rows.Columns()
-        var records [][]interface{}
-        for rows.Next() {
-                values := make([]interface{}, len(cols))
-                valuePtrs := make([]interface{}, len(cols))
-                for i := range values {
-                        valuePtrs[i] = &values[i]
-                }
-                rows.Scan(valuePtrs...)
-                records = append(records, values)
-        }
-        // Заголовки
-        for _, col := range cols {
-                fmt.Printf("%-20s", col)
-        }
-        fmt.Println("\n" + strings.Repeat("-", 20*len(cols)))
-        // Данные
-        for _, record := range records {
-                for _, val := range record {
-                        if val == nil {
-                                fmt.Printf("%-20s", "<NULL>")
-                        } else {
-                                fmt.Printf("%-20v", val)
-                        }
-                }
-                fmt.Println()
-        }
-        fmt.Println()
+	Host, Port, Database, User, Password, SSLMode, LogFile string
 }
 
 func main() {
-        cfg, _ := loadConfig()
-        initLog()
-        // Ввод логина/пароля
-        fmt.Print("Логин: ")
-        userInput, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-        cfg.User = strings.TrimSpace(userInput)
-        fmt.Print("Пароль: ")
-        pass, _ := term.ReadPassword(int(os.Stdin.Fd()))
-        fmt.Println()
-        cfg.Password = string(pass)
-        if err := connectDB(cfg); err != nil {
-                logError("Не удалось подключиться к базе данных")
-                return
-        }
-        logInfo("Подключение к БД успешно")
-        reader := bufio.NewReader(os.Stdin)
-        for {
-                fmt.Println("\n=== МЕНЮ ===")
-                fmt.Println("1. Просмотр таблицы (без фильтра)")
-                fmt.Println("2. Фильтрация по одному полю")
-                fmt.Println("3. Фильтрация по нескольким полям")
-                fmt.Println("4. Обновить одну запись")
-                fmt.Println("5. Обновить несколько записей")
-                fmt.Println("6. Добавить в одну таблицу (одна строка)")
-                fmt.Println("7. Добавить в одну таблицу (несколько строк)")
-                fmt.Println("8. Добавить в связанные таблицы (одна)")
-                fmt.Println("9. Добавить в связанные таблицы (несколько)")
-                fmt.Println("0. Выход")
-                fmt.Print("> ")
-                choice, _ := reader.ReadString('\n')
-                choice = strings.TrimSpace(choice)
-                if choice == "0" {
-                        break
-                }
-                var table string
-                switch choice {
-                case "1", "2", "3", "4", "5", "6", "7":
-                        fmt.Print("Таблица (categories/manufacturers/components/stock): ")
-                        table, _ = reader.ReadString('\n')
-                        table = strings.TrimSpace(table)
-                }
-                switch choice {
-                case "1":
-                        viewAll(table)
-                case "2":
-                        viewFilteredOne(table)
-                case "3":
-                        viewFilteredMultiple(table)
-                case "4":
-                        updateSingle(table)
-                case "5":
-                        updateMultiple(table)
-                case "6":
-                        insertSingle(table)
-                case "7":
-                        insertMultipleSingle(table)
-                case "8":
-                        insertRelated(false)
-                case "9":
-                        insertRelated(true)
-                default:
-                        fmt.Println("Неверный выбор")
-                }
-        }
+	cfg, err := loadEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Неправильный логин или пароль.")
+		os.Exit(1)
+	}
+
+	conn := connect(cfg)
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err == nil {
+			logger = log.New(f, "", log.LstdFlags)
+			defer f.Close()
+		}
+	}
+
+	fmt.Println("Подключение к БД успешно!")
+	(&App{conn, logger}).run()
+}
+
+func loadEnv() (Config, error) {
+	godotenv.Load("config.env")
+	user := read("Логин: ")
+	password := read("Пароль: ")
+	if user == "" || password == "" {
+		return Config{}, fmt.Errorf("пустые данные")
+	}
+	return Config{
+		Host:     os.Getenv("DB_HOST"),
+		Port:     os.Getenv("DB_PORT"),
+		Database: os.Getenv("DB_NAME"),
+		User:     user,
+		Password: password,
+		SSLMode:  os.Getenv("DB_SSLMODE"),
+		LogFile:  os.Getenv("LOG_FILE"),
+	}, nil
+}
+
+func connect(cfg Config) *pgx.Conn {
+	connStr := fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode)
+	conn, err := pgx.Connect(context.Background(), connStr)
+	if err != nil {
+		log.Fatal("Некорректные данные подключения")
+	}
+	return conn
+}
+
+func (a *App) run() {
+	for {
+		printMenu()
+		switch c := choice("> "); c {
+		case "1":
+			a.viewTable()
+		case "2":
+			a.filterTable()
+		case "3":
+			a.updateRecords()
+		case "4":
+			a.insertIntoTable()
+		case "5":
+			a.insertRelated()
+		case "0":
+			fmt.Println("Выход...")
+			return
+		default:
+			fmt.Println("Неверный выбор")
+		}
+	}
+}
+
+func printMenu() {
+	fmt.Println("\n=== МЕНЮ ===")
+	fmt.Println("1. Просмотр таблицы")
+	fmt.Println("2. Фильтрация")
+	fmt.Println("3. Обновить запись")
+	fmt.Println("4. Добавить запись")
+	fmt.Println("5. Добавить в связанные таблицы")
+	fmt.Println("0. Выход")
+}
+
+func read(prompt string) string {
+	fmt.Print(prompt)
+	s := strings.TrimSpace(scan())
+	return s
+}
+
+func choice(prompt string) string {
+	fmt.Print(prompt)
+	return strings.TrimSpace(scan())
+}
+
+func scan() string {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	return scanner.Text()
+}
+
+// === ВЫБОР ===
+func selectOpt(prompt string, opts []string, back bool) string {
+	for {
+		if prompt != "" {
+			fmt.Println(prompt)
+		}
+		for i, o := range opts {
+			fmt.Printf("%d. %s\n", i+1, o)
+		}
+		if back {
+			fmt.Println("0. Назад")
+		}
+		c := choice("> ")
+		if c == "0" && back {
+			return ""
+		}
+		if i, e := strconv.Atoi(c); e == nil && i > 0 && i <= len(opts) {
+			return opts[i-1]
+		}
+		fmt.Println("Неверно")
+	}
+}
+
+func (a *App) selectTable() string {
+	return selectOpt("Таблица:", tables, true)
+}
+
+func (a *App) selectCol(t string) string {
+	return selectOpt("Колонка:", columns[t], true)
+}
+
+func (a *App) selectUpdatableCol(t string) string {
+	var opts []string
+	for _, c := range columns[t] {
+		if c != "id" && !strings.HasSuffix(c, "_id") {
+			opts = append(opts, c)
+		}
+	}
+	if len(opts) == 0 {
+		fmt.Println("В этой таблице нет колонок, доступных для обновления")
+		return ""
+	}
+	return selectOpt("Колонка для обновления:", opts, true)
+}
+
+func (a *App) selectMode() string {
+	return selectOpt("", []string{"Одна", "Несколько"}, true)
+}
+
+// === 1. ПРОСМОТР ===
+func (a *App) viewTable() {
+	t := a.selectTable()
+	if t == "" {
+		return
+	}
+	a.query("SELECT * FROM "+t, nil)
+	a.log("Просмотр: " + t)
+}
+
+// === 2. ФИЛЬТРАЦИЯ ===
+func (a *App) filterTable() {
+	m := a.selectMode()
+	if m == "" {
+		return
+	}
+	t := a.selectTable()
+	if t == "" {
+		return
+	}
+
+	var w []string
+	var args []interface{}
+
+	if m == "Одна" {
+		c := a.selectCol(t)
+		if c == "" {
+			return
+		}
+		v := read(c + ": ")
+		if v == "" {
+			fmt.Println("Значение не может быть пустым")
+			return
+		}
+		w = append(w, c+" = $1")
+		args = append(args, v)
+	} else {
+		for {
+			c := a.selectCol(t)
+			if c == "" {
+				break
+			}
+			v := read(c + ": ")
+			if v == "" {
+				fmt.Println("Значение не может быть пустым")
+				continue
+			}
+			w = append(w, c+" = $"+strconv.Itoa(len(args)+1))
+			args = append(args, v)
+			if choice("Ещё? (y/n): ") != "y" {
+				break
+			}
+		}
+	}
+
+	if len(w) == 0 {
+		return
+	}
+	q := "SELECT * FROM " + t + " WHERE " + strings.Join(w, " AND ")
+	a.query(q, args)
+	a.log("Фильтр: " + q)
+}
+
+// === 3. ОБНОВЛЕНИЕ ===
+func (a *App) updateRecords() {
+	m := a.selectMode()
+	if m == "" {
+		return
+	}
+	t := a.selectTable()
+	if t == "" {
+		return
+	}
+
+	if m == "Одна" {
+		id := read("ID: ")
+		if id == "" {
+			fmt.Println("ID не может быть пустым")
+			return
+		}
+		u, args := a.updates(t)
+		if len(u) == 0 {
+			return
+		}
+		args = append(args, id)
+		q := "UPDATE " + t + " SET " + strings.Join(u, ", ") + " WHERE id = $" + strconv.Itoa(len(args))
+		a.exec(q, args)
+		a.log("Обновление: " + q)
+	} else {
+		ids := read("ID (через запятую): ")
+		c := a.selectUpdatableCol(t)
+		if c == "" {
+			return
+		}
+		v := read("Значение: ")
+		if v == "" {
+			fmt.Println("Значение не может быть пустым")
+			return
+		}
+		idl := split(ids)
+		in := make([]string, 0, len(idl))
+		args := []interface{}{v}
+		for i, id := range idl {
+			if id == "" {
+				continue
+			}
+			in = append(in, "$"+strconv.Itoa(i+2))
+			args = append(args, id)
+		}
+		if len(in) == 0 {
+			fmt.Println("Не указаны корректные ID")
+			return
+		}
+		q := "UPDATE " + t + " SET " + c + " = $1 WHERE id IN (" + strings.Join(in, ",") + ")"
+		a.exec(q, args)
+		a.log("Массовое обновление: " + q)
+	}
+}
+
+func (a *App) updates(t string) ([]string, []interface{}) {
+	var u []string
+	var args []interface{}
+	for {
+		c := a.selectUpdatableCol(t)
+		if c == "" {
+			break
+		}
+		v := read(c + ": ")
+		if v == "" {
+			fmt.Println("Значение не может быть пустым")
+			continue
+		}
+		u = append(u, c+" = $"+strconv.Itoa(len(args)+1))
+		args = append(args, v)
+		if choice("Ещё? (y/n): ") != "y" {
+			break
+		}
+	}
+	return u, args
+}
+
+// === 4. ДОБАВЛЕНИЕ ЗАПИСИ ===
+func (a *App) insertIntoTable() {
+	m := a.selectMode()
+	if m == "" {
+		return
+	}
+	t := a.selectTable()
+	if t == "" {
+		return
+	}
+	if m == "Одна" {
+		a.insertOne(t)
+	} else {
+		a.insertMany(t)
+	}
+}
+
+func (a *App) insertOne(t string) {
+	insertable := columns[t][1:] // кроме id
+	var args []interface{}
+	var placeholders []string
+	for i, col := range insertable {
+		val := strings.TrimSpace(read(col + ": "))
+		if val == "" && col != "description" && col != "country" && col != "founded_year" && col != "model" && col != "warehouse_location" {
+			fmt.Printf("Поле %s обязательно\n", col)
+			return
+		}
+		args = append(args, val)
+		placeholders = append(placeholders, "$"+strconv.Itoa(i+1))
+	}
+	q := `INSERT INTO ` + t + ` (` + strings.Join(insertable, ", ") + `) VALUES (` + strings.Join(placeholders, ", ") + `)`
+	a.exec(q, args)
+	a.log("Вставка одной записи в " + t)
+}
+
+func (a *App) insertMany(t string) {
+	insertable := columns[t][1:]
+	n := readInt("Сколько записей добавить? ")
+	if n <= 0 {
+		return
+	}
+
+	var args []interface{}
+	var rows []string
+	for rec := 1; rec <= n; rec++ {
+		fmt.Printf("\n--- Запись %d из %d ---\n", rec, n)
+		var row []string
+		for _, col := range insertable {
+			val := strings.TrimSpace(read(fmt.Sprintf("%s: ", col)))
+			if val == "" && col != "description" && col != "country" && col != "founded_year" && col != "model" && col != "warehouse_location" {
+				fmt.Printf("Поле %s обязательно\n", col)
+				rec--
+				continue
+			}
+			args = append(args, val)
+			row = append(row, "$"+strconv.Itoa(len(args)))
+		}
+		rows = append(rows, "("+strings.Join(row, ", ")+")")
+	}
+	if len(rows) == 0 {
+		return
+	}
+	q := `INSERT INTO ` + t + ` (` + strings.Join(insertable, ", ") + `) VALUES ` + strings.Join(rows, ", ")
+	a.exec(q, args)
+	a.log(fmt.Sprintf("Множественная вставка %d записей в %s", len(rows), t))
+}
+
+// === 5. ДОБАВЛЕНИЕ В СВЯЗАННЫЕ ТАБЛИЦЫ ===
+func (a *App) insertRelated() {
+	mode := a.selectMode()
+	if mode == "" {
+		return
+	}
+
+	if mode == "Одна" {
+		a.relatedOne()
+	} else {
+		n := readInt("Сколько наборов добавить? ")
+		if n <= 0 {
+			return
+		}
+		success := 0
+		for i := 1; i <= n; i++ {
+			fmt.Printf("\n=== НАБОР %d из %d ===\n", i, n)
+			if a.relatedOne() {
+				success++
+			}
+		}
+		fmt.Printf("\nУспешно добавлено наборов: %d из %d\n", success, n)
+		a.log(fmt.Sprintf("Связанные вставки: %d успешных", success))
+	}
+}
+
+func (a *App) relatedOne() bool {
+	startTable := selectOpt("Выберите таблицу для добавления записи:", []string{"categories", "manufacturers", "components"}, true)
+	if startTable == "" {
+		return false
+	}
+
+	ctx := context.Background()
+	tx, err := a.conn.Begin(ctx)
+	if err != nil {
+		a.userErr("Не удалось начать операцию")
+		return false
+	}
+	defer tx.Rollback(ctx)
+
+	switch startTable {
+	case "categories":
+		// Добавление в categories
+		name := strings.TrimSpace(read("name: "))
+		if name == "" {
+			a.userErr("Некорректные данные в поле name")
+			return false
+		}
+		description := strings.TrimSpace(read("description: "))
+
+		var categoryID int
+		err = tx.QueryRow(ctx, `INSERT INTO categories (name, description) VALUES ($1, $2) RETURNING id`, name, description).Scan(&categoryID)
+		if err != nil {
+			a.userErr("Ошибка при добавлении в categories")
+			return false
+		}
+
+		// Добавление в components
+		fmt.Println("Введите данные для заполнения строки в components")
+		_, ok := a.addComponents(tx, ctx, categoryID, 0) // 0 для manufacturerID, будет запрошен
+		if !ok {
+			return false
+		}
+
+	case "manufacturers":
+		// Добавление в manufacturers
+		name := strings.TrimSpace(read("name: "))
+		if name == "" {
+			a.userErr("Некорректные данные в поле name")
+			return false
+		}
+		country := strings.TrimSpace(read("country: "))
+		yearStr := strings.TrimSpace(read("founded_year: "))
+		year, err := strconv.Atoi(yearStr)
+		if err != nil || year <= 1900 || year > time.Now().Year() {
+			a.userErr("Некорректные данные в поле founded_year")
+			return false
+		}
+
+		var manufacturerID int
+		err = tx.QueryRow(ctx, `INSERT INTO manufacturers (name, country, founded_year) VALUES ($1, $2, $3) RETURNING id`, name, country, year).Scan(&manufacturerID)
+		if err != nil {
+			a.userErr("Ошибка при добавлении в manufacturers")
+			return false
+		}
+
+		// Добавление в components
+		fmt.Println("Введите данные для заполнения строки в components")
+		_, ok := a.addComponents(tx, ctx, 0, manufacturerID) // 0 для categoryID, будет запрошен
+		if !ok {
+			return false
+		}
+
+	case "components":
+		// Добавление в components
+		fmt.Println("Введите данные для заполнения строки в components")
+		componentID, ok := a.addComponents(tx, ctx, 0, 0) // Оба ID запросятся с проверкой
+		if !ok {
+			return false
+		}
+
+		// Добавление в stock
+		fmt.Println("Введите данные для заполнения строки в stock")
+		if !a.addStock(tx, ctx, componentID) {
+			return false
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		a.userErr("Не удалось завершить операцию")
+		return false
+	}
+
+	fmt.Println("Данные внесены в связанные таблицы")
+	a.log(fmt.Sprintf("Связанная вставка в %s и связанные таблицы", startTable))
+	return true
+}
+
+func (a *App) addComponents(tx pgx.Tx, ctx context.Context, knownCategoryID, knownManufacturerID int) (int, bool) {
+	name := strings.TrimSpace(read("name: "))
+	if name == "" {
+		a.userErr("Некорректные данные в поле name")
+		return 0, false
+	}
+
+	var categoryID int
+	if knownCategoryID > 0 {
+		categoryID = knownCategoryID
+	} else {
+		catIDStr := strings.TrimSpace(read("category_id: "))
+		var err error
+		categoryID, err = strconv.Atoi(catIDStr)
+		if err != nil || categoryID <= 0 {
+			a.userErr("Некорректные данные в поле category_id")
+			return 0, false
+		}
+		exists, err := a.checkExists(tx, ctx, "categories", categoryID)
+		if err != nil || !exists {
+			a.userErr("Некорректный category_id")
+			return 0, false
+		}
+	}
+
+	var manufacturerID int
+	if knownManufacturerID > 0 {
+		manufacturerID = knownManufacturerID
+	} else {
+		manIDStr := strings.TrimSpace(read("manufacturer_id: "))
+		var err error
+		manufacturerID, err = strconv.Atoi(manIDStr)
+		if err != nil || manufacturerID <= 0 {
+			a.userErr("Некорректные данные в поле manufacturer_id")
+			return 0, false
+		}
+		exists, err := a.checkExists(tx, ctx, "manufacturers", manufacturerID)
+		if err != nil || !exists {
+			a.userErr("Некорректный manufacturer_id")
+			return 0, false
+		}
+	}
+
+	model := strings.TrimSpace(read("model: "))
+	priceStr := strings.TrimSpace(read("price: "))
+	price, err := strconv.ParseFloat(priceStr, 64)
+	if err != nil || price < 0 {
+		a.userErr("Некорректные данные в поле price")
+		return 0, false
+	}
+
+	var componentID int
+	err = tx.QueryRow(ctx, `
+		INSERT INTO components (name, category_id, manufacturer_id, model, price)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		name, categoryID, manufacturerID, model, price).Scan(&componentID)
+	if err != nil {
+		a.userErr("Ошибка при добавлении в components")
+		return 0, false
+	}
+
+	return componentID, true
+}
+
+func (a *App) addStock(tx pgx.Tx, ctx context.Context, componentID int) bool {
+	quantityStr := strings.TrimSpace(read("quantity: "))
+	quantity, err := strconv.Atoi(quantityStr)
+	if err != nil || quantity < 0 {
+		a.userErr("Некорректные данные в поле quantity")
+		return false
+	}
+	warehouse := strings.TrimSpace(read("warehouse_location: "))
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO stock (component_id, quantity, warehouse_location)
+		VALUES ($1, $2, $3)`, componentID, quantity, warehouse)
+	if err != nil {
+		a.userErr("Ошибка при добавлении в stock")
+		return false
+	}
+	return true
+}
+
+func (a *App) checkExists(tx pgx.Tx, ctx context.Context, table string, id int) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE id = $1)", table), id).Scan(&exists)
+	return exists, err
+}
+
+// === УТИЛИТЫ ===
+func (a *App) exec(q string, args []interface{}) {
+	if _, e := a.conn.Exec(context.Background(), q, args...); e != nil {
+		a.userErr("Не удалось выполнить операцию")
+		a.logger.Println("SQL ERROR: " + e.Error() + " | QUERY: " + q)
+	} else {
+		fmt.Println("Готово")
+	}
+}
+
+func (a *App) query(q string, args []interface{}) {
+	r, e := a.conn.Query(context.Background(), q, args...)
+	if e != nil {
+		a.userErr("Ошибка при запросе данных")
+		a.logger.Println("QUERY ERROR: " + e.Error())
+		return
+	}
+	defer r.Close()
+	printTable(r)
+}
+
+func printTable(r pgx.Rows) {
+	d := r.FieldDescriptions()
+	h := make([]string, len(d))
+	w := make([]int, len(d))
+	for i, f := range d {
+		h[i] = string(f.Name)
+		if len(h[i]) > w[i] {
+			w[i] = len(h[i])
+		}
+	}
+
+	data := [][]string{}
+	for r.Next() {
+		v := make([]interface{}, len(d))
+		p := make([]interface{}, len(d))
+		for i := range v {
+			p[i] = &v[i]
+		}
+		r.Scan(p...)
+		row := make([]string, len(d))
+		for i, val := range v {
+			s := "NULL"
+			if val != nil {
+				s = fmt.Sprint(val)
+			}
+			row[i] = s
+			if len(s) > w[i] {
+				w[i] = len(s)
+			}
+		}
+		data = append(data, row)
+	}
+
+	printRow(h, w)
+	fmt.Println(strings.Repeat("=", sum(w)+3*len(w)+1))
+	for _, row := range data {
+		printRow(row, w)
+	}
+}
+
+func printRow(r []string, w []int) {
+	p := make([]string, len(r))
+	for i, c := range r {
+		p[i] = pad(c, w[i])
+	}
+	fmt.Printf("| %s |\n", strings.Join(p, " | "))
+}
+
+func pad(s string, width int) string {
+	if len(s) < width {
+		return s + strings.Repeat(" ", width-len(s))
+	}
+	return s
+}
+
+func sum(a []int) int {
+	s := 0
+	for _, v := range a {
+		s += v
+	}
+	return s
+}
+
+func readInt(p string) int {
+	for {
+		if n, e := strconv.Atoi(read(p)); e == nil && n > 0 {
+			return n
+		}
+		fmt.Println("Введите число больше 0")
+	}
+}
+
+func split(s string) []string {
+	p := strings.Split(s, ",")
+	for i := range p {
+		p[i] = strings.TrimSpace(p[i])
+	}
+	return p
+}
+
+func (a *App) log(m string) {
+	a.logger.Println(m)
+}
+
+func (a *App) userErr(m string) {
+	a.logger.Println("USER ERROR: " + m)
+	fmt.Fprintln(os.Stderr, "Ошибка: "+m)
 }
