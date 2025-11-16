@@ -1,9 +1,3 @@
--- Удаляем старые таблицы, если они есть
-DROP TABLE IF EXISTS stock CASCADE;
-DROP TABLE IF EXISTS components CASCADE;
-DROP TABLE IF EXISTS manufacturers CASCADE;
-DROP TABLE IF EXISTS categories CASCADE;
-
 -- 1. Категории
 CREATE TABLE categories (
     id          SERIAL PRIMARY KEY,
