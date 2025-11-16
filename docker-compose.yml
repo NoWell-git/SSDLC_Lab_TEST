@@ -12,21 +12,26 @@ services:
       - "5432:5432"
     volumes:
       - ./pgdata:/var/lib/postgresql/data
+    networks:
+      - appnet
 
   pc-app:
     build:
       context: .
       dockerfile: Dockerfile.app
-    container_name: lab3_app
+    container_name: pc-app
     env_file:
-      - config.env
+      - config.env  # Также служит демонстрационным примером для пункта 6.10
+    environment:
+      LOG_FILE: /logs/app.log  # Переопределение для контейнера: логи пишутся в /logs/app.log
+    volumes:
+      - ./logs:/logs
     depends_on:
       - postgres
     stdin_open: true
     tty: true
-    volumes:
-      - ./logs:/logs
-    network_mode: service:postgres
+    networks:
+      - appnet
 
   adminer:
     image: adminer
@@ -35,3 +40,12 @@ services:
       - postgres
     ports:
       - "8080:8080"
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  pgdata:
